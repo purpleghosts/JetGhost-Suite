@@ -4,6 +4,8 @@ JetGhost is a small toolset for finding **CMS media timeleaks**, that is to say 
 
 The main focus is **WordPress + Jetpack / WordPress.com image sitemaps**, where **attachments** can keep being listed (and therefore trivially discoverable) even after you remove or replace them in the live post HTML.
 
+More info and deep-dive: [https://labs.itresit.es/2025/12/17/cms-media-timeleaks-jetpack-wordpress/](https://labs.itresit.es/2025/12/17/cms-media-timeleaks-jetpack-wordpress/)
+
 ## Repository layout
 
 - **`tools/jetghost/jetghost.py`** — main auditor: diffs sitemap-declared media vs live HTML
