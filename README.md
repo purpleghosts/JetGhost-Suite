@@ -1,6 +1,6 @@
 # JetGhost
 
-JetGhost is a small toolset for finding **CMS media timeleaks**—cases where media files (screenshots, diagrams, slide images, videos, PDFs, etc.) escape their intended editorial timeline.
+JetGhost is a small toolset for finding **CMS media timeleaks**, that is to say cases where media files (screenshots, diagrams, slide images, videos, PDFs, etc.) escape their intended editorial timeline.
 
 The main focus is **WordPress + Jetpack / WordPress.com image sitemaps**, where **attachments** can keep being listed (and therefore trivially discoverable) even after you remove or replace them in the live post HTML.
 
