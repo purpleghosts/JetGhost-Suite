@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# NOTE (legacy): Archived PoC. Use tools/poc/img-exfil.py or tools/jetghost/jetghost.py instead.
+
+
+"""
+GhostPress v0.1
+
+Sitemap Image Presence Checker
+
+- Detects the sitemap (sitemap.xml / sitemap_index.xml / robots.txt).
+- Follows sitemapindex -> child urlsets (WordPress-friendly).
+- For each <url>, compares images declared in the sitemap vs. images found in the HTML.
+- --brief prints ONLY the missing images, one per line: "<article_url>\t<missing_image_url>"
+
+Exit codes:
+ 0 = OK (no missing images)
+ 1 = Discrepancies (missing images found)
+ 2 = Could not locate/fetch sitemap
+ 3 = Sitemap contained zero <url> entries
+"""
+
+import argparse
+import re
+import sys
+import time
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import requests
+from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
+
+UA = "Mozilla/5.0 (compatible; SitemapImageChecker/1.2; +https://example.local)"
+
+def fetch(url: str, timeout: int = 15) -> requests.Response:
+    """HTTP GET with a friendly UA and sane defaults."""
+    resp = requests.get(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+        },
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+    return resp
+
+def normalize_url(u: str) -> str:
+    """Normalize URL for comparisons: strip query/fragment, keep scheme/host/path."""
+    p = urlparse(u)
+    return urlunparse(p._replace(query="", fragment=""))
+
+def filename_key(u: str) -> str:
+    """
+    Fuzzy key by filename (robust to WP variants):
+    - lowercase basename without extension
+    - strip -123x456, -scaled, @2x suffixes
+    """
+    path = urlparse(u).path
+    base = path.rsplit("/", 1)[-1]
+    name = base.rsplit(".", 1)[0] if "." in base else base
+    name = re.sub(r"-(\d{2,5})x(\d{2,5})$", "", name)   # -800x600
+    name = re.sub(r"-scaled$", "", name, flags=re.I)    # -scaled
+    name = re.sub(r"@[\dx]+$", "", name)                # @2x
+    return name.lower()
+
+def tag_localname(tag: str) -> str:
+    """Get localname from '{ns}name' or 'name'."""
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+def direct_children_by_localname(el: ET.Element, name: str):
+    """Direct children with a given localname (NS-agnostic)."""
+    return [c for c in list(el) if tag_localname(c.tag) == name]
+
+def first_direct_child_text(el: ET.Element, name: str) -> str | None:
+    """First direct child text by localname; returns None if not found/empty."""
+    for c in list(el):
+        if tag_localname(c.tag) == name:
+            t = (c.text or "").strip()
+            if t:
+                return t
+    return None
+
+def parse_xml(text: str) -> ET.Element:
+    """Parse XML string to ElementTree root."""
+    return ET.fromstring(text)
+
+def guess_sitemap_url(site: str, timeout: int) -> str | None:
+    """Try /sitemap.xml, /sitemap_index.xml, then robots.txt Sitemap: entries."""
+    site = site.rstrip("/")
+    for cand in (f"{site}/sitemap.xml", f"{site}/sitemap_index.xml"):
+        try:
+            r = fetch(cand, timeout)
+            if r.status_code == 200 and r.text.strip():
+                return cand
+        except Exception:
+            pass
+    # robots.txt fallback
+    try:
+        r = fetch(f"{site}/robots.txt", timeout)
+        for ln in r.text.splitlines():
+            if ln.lower().startswith("sitemap:"):
+                sm_url = ln.split(":", 1)[1].strip()
+                if sm_url:
+                    try:
+                        rr = fetch(sm_url, timeout)
+                        if rr.status_code == 200 and rr.text.strip():
+                            return sm_url
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return None
+
+def iter_urlsets_from_sitemap(sitemap_url: str, timeout: int = 15):
+    """
+    Yield (sub_sitemap_url, urlset_root) for each urlset discovered.
+    Follows sitemapindex -> sub-sitemaps automatically.
+    """
+    r = fetch(sitemap_url, timeout)
+    root = parse_xml(r.text)
+    root_name = tag_localname(root.tag)
+
+    if root_name == "sitemapindex":
+        for sm in direct_children_by_localname(root, "sitemap"):
+            loc = first_direct_child_text(sm, "loc")
+            if not loc:
+                continue
+            try:
+                rr = fetch(loc, timeout)
+                sub_root = parse_xml(rr.text)
+                if tag_localname(sub_root.tag) == "urlset":
+                    yield loc, sub_root
+            except Exception as e:
+                print(f"[WARN] Could not open sub-sitemap {loc}: {e}", file=sys.stderr)
+    elif root_name == "urlset":
+        yield sitemap_url, root
+    else:
+        print(f"[WARN] {sitemap_url} is neither sitemapindex nor urlset (root={root_name}).", file=sys.stderr)
+
+def extract_entries(urlset_root: ET.Element):
+    """
+    Return list of dicts: {loc: str, images: [str]}
+    WordPress uses <url> with nested <image:image><image:loc>…</image:loc></image:image>
+    """
+    entries = []
+    for url_el in direct_children_by_localname(urlset_root, "url"):
+        loc_text = first_direct_child_text(url_el, "loc")
+        if not loc_text:
+            continue
+
+        imgs = []
+        # Handle image namespace agnostically: localname 'image' then 'loc'
+        for img_el in direct_children_by_localname(url_el, "image"):
+            for loc_el in direct_children_by_localname(img_el, "loc"):
+                t = (loc_el.text or "").strip()
+                if t:
+                    imgs.append(t)
+
+        # Fallback: scan for any descendant ending with localname 'loc' under an 'image' node
+        if not imgs:
+            for child in url_el.iter():
+                if tag_localname(child.tag) == "loc" and child.text and "/uploads/" in child.text:
+                    imgs.append(child.text.strip())
+
+        entries.append({"loc": loc_text, "images": imgs})
+    return entries
+
+def extract_page_images(page_url: str, html: str) -> tuple[set[str], set[str]]:
+    """
+    Collect image URLs from HTML:
+    - <img src|data-src|data-lazy-src|data-original>
+    - srcset/data-srcset (split by comma)
+    - <source srcset> inside <picture>
+    - <meta property="og:image">
+    Returns (normalized_urls, fuzzy_keys)
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    urls = set()
+
+    # <img> tags
+    for img in soup.find_all("img"):
+        for attr in ("src", "data-src", "data-lazy-src", "data-original"):
+            v = img.get(attr)
+            if v:
+                urls.add(normalize_url(urljoin(page_url, v)))
+        for attr in ("srcset", "data-srcset"):
+            v = img.get(attr)
+            if v:
+                for part in v.split(","):
+                    u = part.strip().split(" ")[0]
+                    if u:
+                        urls.add(normalize_url(urljoin(page_url, u)))
+
+    # <source srcset="...">
+    for src in soup.find_all("source"):
+        v = src.get("srcset")
+        if v:
+            for part in v.split(","):
+                u = part.strip().split(" ")[0]
+                if u:
+                    urls.add(normalize_url(urljoin(page_url, u)))
+
+    # og:image
+    for m in soup.find_all("meta", attrs={"property": "og:image"}):
+        v = m.get("content")
+        if v:
+            urls.add(normalize_url(urljoin(page_url, v)))
+
+    keys = {filename_key(u) for u in urls if u}
+    return urls, keys
+
+def check_article_images(article_url: str, declared_imgs: list[str], timeout: int = 15) -> dict:
+    """
+    Compare declared sitemap images vs. images present in HTML.
+    Matches:
+      - exact normalized URL
+      - fuzzy by filename key (ignores WP suffixes, allows extension changes)
+    """
+    try:
+        r = fetch(article_url, timeout)
+    except Exception as e:
+        return {
+            "url": article_url,
+            "declared": declared_imgs,
+            "present_exact": [],
+            "present_fuzzy": [],
+            "missing": declared_imgs[:],
+            "error": f"Article fetch failed: {e}",
+        }
+
+    page_urls, page_keys = extract_page_images(article_url, r.text)
+
+    present_exact, present_fuzzy, missing = [], [], []
+    for img in declared_imgs:
+        abs_img = img if urlparse(img).netloc else urljoin(article_url, img)
+        norm_img = normalize_url(abs_img)
+        key = filename_key(norm_img)
+
+        if norm_img in page_urls:
+            present_exact.append(img)
+        elif key in page_keys:
+            present_fuzzy.append(img)
+        else:
+            missing.append(img)
+
+    return {
+        "url": article_url,
+        "declared": declared_imgs,
+        "present_exact": present_exact,
+        "present_fuzzy": present_fuzzy,
+        "missing": missing,
+        "error": None,
+    }
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Verify that sitemap-declared images actually appear in each article."
+    )
+    ap.add_argument("site", help="Base site (https://domain) or direct sitemap URL (.xml)")
+    ap.add_argument("--timeout", type=int, default=15, help="Network timeout in seconds (default: 15)")
+    ap.add_argument("--sleep", type=float, default=0.2, help="Pause between requests to be polite (default: 0.2s)")
+    ap.add_argument("--limit", type=int, default=0, help="Process only N URLs per urlset (0 = all)")
+    ap.add_argument("--brief", action="store_true",
+                    help="Only print missing images, one per line: '<article_url>\\t<missing_image_url>'")
+    args = ap.parse_args()
+
+    # Determine sitemap URL if a domain is provided
+    if args.site.endswith(".xml"):
+        sitemap_url = args.site
+    else:
+        sitemap_url = guess_sitemap_url(args.site, args.timeout)
+
+    if not sitemap_url:
+        print("[ERROR] Could not locate a sitemap for the provided site.", file=sys.stderr)
+        sys.exit(2)
+
+    any_alert = False
+    total_entries = 0
+
+    # In brief mode we suppress info banners; in normal mode we provide progress.
+    if not args.brief:
+        print(f"[INFO] Using sitemap: {sitemap_url}")
+
+    for sub_url, urlset in iter_urlsets_from_sitemap(sitemap_url, timeout=args.timeout):
+        entries = extract_entries(urlset)
+        if args.limit > 0:
+            entries = entries[: args.limit]
+        total_entries += len(entries)
+
+        if not args.brief:
+            print(f"\n[INFO] Sub-sitemap: {sub_url} — {len(entries)} entries")
+
+        for entry in entries:
+            loc = entry["loc"]
+            imgs = entry["images"]
+
+            res = check_article_images(loc, imgs, timeout=args.timeout)
+            if res["error"]:
+                # In brief mode, errors go to stderr to keep STDOUT clean
+                print(f"[ERROR] {loc}: {res['error']}", file=sys.stderr)
+                any_alert = True
+                time.sleep(args.sleep)
+                continue
+
+            if res["missing"]:
+                any_alert = True
+                if args.brief:
+                    # Minimal: only missing image lines
+                    for m in res["missing"]:
+                        print(f"{m}")
+                else:
+                    print(f"\nURL: {loc}")
+                    print(">>> ALERT: Missing images declared in sitemap that do not appear in the article:")
+                    for m in res["missing"]:
+                        print(f"    - {m}")
+
+            time.sleep(args.sleep)
+
+    if total_entries == 0:
+        if not args.brief:
+            print("\n[WARN] The analyzed sitemap contains zero <url> entries (WAF/HTML error? inaccessible sub-sitemaps?).")
+        sys.exit(3)
+
+    if any_alert:
+        if not args.brief:
+            print("\n[SUMMARY] Discrepancies detected. See alerts above.")
+        sys.exit(1)
+    else:
+        if not args.brief:
+            print("\n[SUMMARY] All good: sitemap-declared images match page HTML.")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
